@@ -526,68 +526,127 @@ function openHistory(){state.historyOpen=true;state.historySelected=null;render(
 function closeHistory(){state.historyOpen=false;state.historySelected=null;render();}
 function selectHistory(i){state.historySelected=i;render();}
 
-async function generateInsight(){
+function generateInsight(){
   if(!state.savedSession)return;
   state.insightLoading=true;state.insightText=null;render();
-  try{
-    const dayInfo=DAY_MAP[state.savedSession.dayId];
-    const allEx={...EX_MAP};
-    (state.savedSession.customExercises||[]).forEach(c=>{allEx[c.id]=c;});
-    const recentLogs=state.logs.filter(l=>l.dayId===state.savedSession.dayId).slice(-6);
-    const trends={};
-    recentLogs.forEach(log=>{
-      Object.entries(log.sets||{}).forEach(([exId,sets])=>{
-        const vals=Object.values(sets).map(v=>typeof v==="object"?v.val:v);
-        if(!vals.length)return;
-        const best=Math.max(...vals);
-        if(!trends[exId])trends[exId]=[];
-        trends[exId].push({date:log.date,best});
+
+  // ── Local data-driven insight engine ─────────────────────────────────────
+  setTimeout(function(){
+    try{
+      var log=state.savedSession;
+      var allEx=Object.assign({},EX_MAP);
+      (log.customExercises||[]).forEach(function(c){allEx[c.id]=c;});
+      var sameDayLogs=state.logs.filter(function(l){return l.dayId===log.dayId;});
+      var lines=[];
+
+      // Build per-exercise history across all same-day sessions
+      var exHistory={};
+      sameDayLogs.forEach(function(l){
+        Object.entries(l.sets||{}).forEach(function(entry){
+          var exId=entry[0],sets=entry[1];
+          var vals=Object.values(sets).map(function(v){return typeof v==="object"?v.val:v;});
+          if(!vals.length)return;
+          var best=Math.max.apply(null,vals);
+          if(!exHistory[exId])exHistory[exId]=[];
+          exHistory[exId].push({date:l.date,best:best});
+        });
       });
-    });
-    const sessionSummary=Object.entries(state.savedSession.sets||{}).map(([exId,sets])=>{
-      const ex=allEx[exId];if(!ex)return null;
-      const vals=Object.values(sets).map(v=>typeof v==="object"?v.val:v);
-      const best=Math.max(...vals);
-      const pb=state.pbs[exId];const pbVal=typeof pb==="object"?(pb&&pb.val):pb;
-      return`${ex.name}: ${vals.length} sets, best ${best}${ex.unit==="sec"?"s":" reps"}${pbVal&&best>=pbVal?" (NEW PB!)":""}`;
-    }).filter(Boolean).join("\n");
-    const trendSummary=Object.entries(trends).map(([exId,hist])=>{
-      const ex=allEx[exId];if(!ex||hist.length<2)return null;
-      const first=hist[0].best,last=hist[hist.length-1].best;
-      const trend=last>first?"improving":last<first?"declining":"plateau";
-      return`${ex.name}: ${trend} (${first}→${last}${ex.unit==="sec"?"s":" reps"} over ${hist.length} sessions)`;
-    }).filter(Boolean).join("\n");
 
-    const prompt=`You are a calisthenics coach reviewing a training session for an advanced athlete.
+      // ── 1. Session overview ──────────────────────────────────────────────
+      var exLogged=Object.keys(log.sets||{}).length;
+      var dur=log.duration||0;
+      var pbHits=[];
+      var nearPb=[];
 
-Day: ${(dayInfo&&dayInfo.title)} — ${(dayInfo&&dayInfo.subtitle)}
-Session notes: "${state.savedSession.notes||"none"}"
-Duration: ${state.savedSession.duration} min
+      Object.entries(log.sets||{}).forEach(function(entry){
+        var exId=entry[0],sets=entry[1];
+        var ex=allEx[exId];if(!ex)return;
+        var vals=Object.values(sets).map(function(v){return typeof v==="object"?v.val:v;});
+        if(!vals.length)return;
+        var best=Math.max.apply(null,vals);
+        var pb=state.pbs[exId];
+        var pbVal=typeof pb==="object"?(pb&&pb.val):pb;
+        if(pbVal&&best>=pbVal)pbHits.push(ex.name+" ("+best+(ex.unit==="sec"?"s":" reps")+")");
+        else if(pbVal&&best>=pbVal*0.9)nearPb.push(ex.name);
+      });
 
-TODAY'S SESSION:
-${sessionSummary||"No sets logged"}
+      if(pbHits.length){
+        lines.push("🏆 New PB"+( pbHits.length>1?"s":"")+": "+pbHits.join(", ")+".");
+      } else {
+        lines.push("Session logged: "+exLogged+" exercises in "+dur+" min.");
+      }
 
-RECENT TRENDS (last 6 sessions, same day):
-${trendSummary||"Not enough history yet"}
+      // ── 2. Trend analysis ────────────────────────────────────────────────
+      var improving=[],plateauing=[],declining=[];
 
-Write a brief, sharp coaching insight (3–5 sentences). Be specific — reference actual exercises and numbers. Include:
-1. One observation about today's performance
-2. One trend you notice (positive or concern)
-3. One concrete recommendation for next session
+      Object.entries(exHistory).forEach(function(entry){
+        var exId=entry[0],hist=entry[1];
+        var ex=allEx[exId];if(!ex||hist.length<3)return;
+        var recent=hist.slice(-3).map(function(h){return h.best;});
+        var oldest=recent[0],latest=recent[recent.length-1];
+        var delta=latest-oldest;
+        var pct=oldest>0?delta/oldest:0;
+        if(pct>0.05)improving.push({name:ex.name,delta:delta,unit:ex.unit,latest:latest});
+        else if(pct<-0.05)declining.push({name:ex.name,delta:delta,unit:ex.unit,latest:latest});
+        else if(hist.length>=4)plateauing.push({name:ex.name,sessions:hist.length,latest:latest,unit:ex.unit});
+      });
 
-Tone: experienced coach, no fluff, no generic advice.`;
+      if(improving.length){
+        var best=improving[0];
+        lines.push("📈 "+best.name+" is trending up — "+best.latest+(best.unit==="sec"?"s":" reps")+" best this session, up "+Math.abs(best.delta)+(best.unit==="sec"?"s":" reps")+" over last 3 sessions.");
+      } else if(plateauing.length){
+        var pl=plateauing[0];
+        lines.push("⚠️ "+pl.name+" has plateaued at "+pl.latest+(pl.unit==="sec"?"s":" reps")+" across "+pl.sessions+" sessions — time to change the stimulus.");
+      } else if(declining.length){
+        var dc=declining[0];
+        lines.push("📉 "+dc.name+" has dipped — consider whether fatigue or technique is the limiting factor.");
+      } else if(sameDayLogs.length<3){
+        lines.push("Not enough sessions yet for trend analysis — keep logging and patterns will emerge.");
+      } else {
+        lines.push("Performance is consistent across exercises — a sign of solid training discipline.");
+      }
 
-    const res=await fetch("https://api.anthropic.com/v1/messages",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:300,messages:[{role:"user",content:prompt}]})
-    });
-    const data=await res.json();
-    state.insightText=(data.content&&data.content.filter)(b=>b.type==="text").map(b=>b.text).join("").trim()||"No insight generated.";
-  }catch(e){
-    state.insightText="Couldn't generate insight — check connection and try again.";
-  }
-  state.insightLoading=false;render();
+      // ── 3. Specific next-session recommendation ──────────────────────────
+      var rec="";
+      if(plateauing.length){
+        var p=plateauing[0];
+        if(p.unit==="sec"){
+          rec="For "+p.name+": try adding a harder progression (e.g. move one level up) rather than chasing more seconds at this level.";
+        } else {
+          rec="For "+p.name+": add load, slow the eccentric to 4 sec, or reduce rest to break the plateau.";
+        }
+      } else if(declining.length){
+        rec="Prioritise recovery before next "+DAY_MAP[log.dayId].title+" session — declining numbers usually signal accumulated fatigue, not a technique issue.";
+      } else if(pbHits.length){
+        rec="After a PB session, take an extra rest day before training this pattern again. Quality over frequency.";
+      } else if(nearPb.length){
+        rec=nearPb[0]+" is close to a PB — next session, prioritise it first when CNS is freshest.";
+      } else {
+        // Skill-specific advice based on day
+        var dayId=log.dayId;
+        if(dayId==="push")rec="Focus on scapula protraction cue in planche work next session — it's the single biggest lever for planche progress.";
+        else if(dayId==="pull")rec="Prioritise scapula depression at the start of every front lever set next session before worrying about hold time.";
+        else rec="Add 1 sec to your L-sit hold target next session — small progressive overload adds up fast on timed skills.";
+      }
+      lines.push("💡 "+rec);
+
+      // ── 4. Notes acknowledgement ─────────────────────────────────────────
+      if(log.notes&&log.notes.trim()){
+        var note=log.notes.trim().toLowerCase();
+        if(note.indexOf("tight")>-1||note.indexOf("sore")>-1||note.indexOf("pain")>-1||note.indexOf("niggle")>-1){
+          lines.push("You flagged discomfort in your notes — factor that in before next session and don't push through joint pain.");
+        } else if(note.indexOf("good")>-1||note.indexOf("great")>-1||note.indexOf("strong")>-1){
+          lines.push("Sounds like a strong session from your notes — log what felt different and try to replicate it.");
+        }
+      }
+
+      state.insightText=lines.join(" ");
+    }catch(e){
+      state.insightText="Not enough data yet — log a few sessions and the insight engine will have something to work with.";
+    }
+    state.insightLoading=false;
+    render();
+  },600); // small delay so the "Analysing…" state is visible
 }
 
 // ─── RENDER ───────────────────────────────────────────────────────────────────
@@ -832,17 +891,17 @@ function renderSetRow(ex,setNum,day,isCustom){
 }
 
 function handleLog(exId,setNum,restSec,isLast){
-  const valEl=document.getElementById(`val_${exId}_${setNum}`);
-  const kgEl=document.getElementById(`kg_${exId}_${setNum}`);
+  const valEl=document.getElementById("val_"+exId+"_"+setNum);
+  const kgEl=document.getElementById("kg_"+exId+"_"+setNum);
   const val=(valEl&&valEl.value);
   if(!val)return;
   const kg=(kgEl&&kgEl.value)||null;
   logSet(exId,setNum,val,kg,restSec,isLast);
   // Update btn without full re-render
-  const btn=document.getElementById(`logbtn_${exId}_${setNum}`);
-  const bubble=document.getElementById(`bubble_${exId}_${setNum}`);
+  const btn=document.getElementById("logbtn_"+exId+"_"+setNum);
+  const bubble=document.getElementById("bubble_"+exId+"_"+setNum);
   const day=DAYS[state.activeDay];
-  const isCustom=!!state.customExs.find(e=>e.id===exId);
+  const isCustom=!!state.customExs.find(function(e){return e.id===exId;});
   const accentColor=isCustom?"#fbbf24":day.color;
   if(btn){btn.style.background=accentColor+"22";btn.style.color=accentColor;btn.textContent="✓";}
   if(bubble){bubble.style.background=accentColor;bubble.style.borderColor=accentColor;bubble.style.color="#000";}
@@ -931,10 +990,17 @@ function renderAddModal(){
             </div>
           </div>
           <div style="flex:1">
-            <label class="modal-label">Weight?</label>
-            <button id="btn-weighted" onclick="this.dataset.on=this.dataset.on==='1'?'0':'1';this.style.background=this.dataset.on==='1'?'rgba(245,166,35,0.1)':'#111';this.style.color=this.dataset.on==='1'?'#f5a623':'#444';this.style.borderColor=this.dataset.on==='1'?'rgba(245,166,35,0.4)':'#1e1e1e';this.textContent=this.dataset.on==='1'?'⚖ Yes':'Bodyweight'"
-              data-on="0" style="width:100%;padding:9px 0;border-radius:8px;border:1px solid #1e1e1e;background:#111;color:#444;font-size:12px;font-weight:600">Bodyweight</button>
+            <label class="modal-label">Tracking</label>
+            <div class="toggle-row">
+              <button class="toggle-btn active" id="btn-bw" onclick="document.getElementById('btn-bw').classList.add('active');document.getElementById('btn-wt').classList.remove('active');document.getElementById('weight-input-row').style.display='none'">Bodyweight</button>
+              <button class="toggle-btn" id="btn-wt" onclick="document.getElementById('btn-wt').classList.add('active');document.getElementById('btn-bw').classList.remove('active');document.getElementById('weight-input-row').style.display='flex'">+ Weight</button>
+            </div>
           </div>
+        </div>
+        <div id="weight-input-row" style="display:none;align-items:center;gap:10px;margin-bottom:18px;background:#111;border:1px solid #252525;border-radius:8px;padding:10px 12px">
+          <span style="font-size:12px;color:#666;flex-shrink:0">Starting weight</span>
+          <input class="modal-input" id="add-kg" type="number" inputmode="decimal" placeholder="e.g. 10" style="flex:1;margin:0">
+          <span style="font-size:12px;color:#555;flex-shrink:0">kg</span>
         </div>
         <div style="display:flex;gap:8px">
           <button onclick="closeModal()" style="flex:1;padding:10px 0;border-radius:8px;border:1px solid #222;background:#111;color:#555;font-size:13px;font-weight:600">Cancel</button>
@@ -947,16 +1013,22 @@ function renderAddModal(){
 
 function submitAddModal(){
   const m=state.addModal;
-  const name=(document.getElementById("add-name")&&document.getElementById("add-name").value).trim();
+  const nameEl=document.getElementById("add-name");
+  const name=nameEl?nameEl.value.trim():"";
   if(!name)return;
-  const sets=Number((document.getElementById("add-sets")&&document.getElementById("add-sets").value))||3;
-  const rest=Number((document.getElementById("add-rest")&&document.getElementById("add-rest").value))||90;
-  const isSec=(document.getElementById("btn-sec")&&document.getElementById("btn-sec").classList).contains("active");
-  const isWeighted=(document.getElementById("btn-weighted")&&document.getElementById("btn-weighted").dataset).on==="1";
-  const isSub=(document.getElementById("btn-sub")&&document.getElementById("btn-sub").classList).contains("active");
+  const setsEl=document.getElementById("add-sets");
+  const restEl=document.getElementById("add-rest");
+  const sets=Number(setsEl?setsEl.value:3)||3;
+  const rest=Number(restEl?restEl.value:90)||90;
+  const secBtn=document.getElementById("btn-sec");
+  const isSec=secBtn?secBtn.classList.contains("active"):false;
+  const wtBtn=document.getElementById("btn-wt");
+  const isWeighted=wtBtn?wtBtn.classList.contains("active"):false;
+  const subBtn=document.getElementById("btn-sub");
+  const isSub=subBtn?subBtn.classList.contains("active"):false;
   const kind=m.replacingName?"sub":(isSub?"sub":"extra");
-  addCustomEx({id:uid(),name,tag:kind==="sub"?"Sub":"Custom",defaultSets:sets,unit:isSec?"sec":"reps",
-    restSec:rest,hasWeight:isWeighted,note:m.replacingName?`Sub for ${m.replacingName}`:"Added exercise",
+  addCustomEx({id:uid(),name:name,tag:kind==="sub"?"Sub":"Custom",defaultSets:sets,unit:isSec?"sec":"reps",
+    restSec:rest,hasWeight:isWeighted,note:m.replacingName?"Sub for "+m.replacingName:"Added exercise",
     tips:[],isCustom:true,kind});
 }
 
